@@ -1,1 +1,420 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple Rhythm Game</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: white; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        canvas { display: block; }
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        .pointer-events-auto { pointer-events: auto; }
+        
+        /* 判定テキストのアニメーション */
+        @keyframes popup {
+            0% { transform: scale(0.5); opacity: 1; }
+            50% { transform: scale(1.2); opacity: 1; }
+            100% { transform: scale(1); opacity: 0; }
+        }
+        .judge-text {
+            position: absolute;
+            top: 60%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 3rem;
+            font-weight: bold;
+            opacity: 0;
+            text-shadow: 0 0 10px currentColor;
+        }
+        .animate-popup { animation: popup 0.5s ease-out forwards; }
+    </style>
+</head>
+<body>
 
+    <!-- ゲーム描画用キャンバス -->
+    <canvas id="gameCanvas"></canvas>
+
+    <!-- UIレイヤー -->
+    <div id="ui-layer" class="flex flex-col justify-between p-4">
+        <div class="flex justify-between items-start">
+            <div>
+                <div class="text-xl text-gray-400">SCORE</div>
+                <div id="scoreDisplay" class="text-4xl font-bold">0</div>
+            </div>
+            <div class="text-right">
+                <div class="text-xl text-gray-400">COMBO</div>
+                <div id="comboDisplay" class="text-4xl font-bold transition-transform duration-100 origin-right" style="color: #ffffff;">0</div>
+            </div>
+        </div>
+        
+        <!-- 判定表示 -->
+        <div id="judgeDisplay" class="judge-text"></div>
+    </div>
+
+    <!-- スタート画面 -->
+    <div id="startScreen" class="absolute inset-0 bg-black/80 flex flex-col items-center justify-center pointer-events-auto transition-opacity duration-300">
+        <h1 class="text-5xl font-bold mb-8 text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-purple-500">
+            SIMPLE RHYTHM
+        </h1>
+        <p class="mb-8 text-xl text-gray-300">使用キー: <span class="font-bold text-white bg-gray-800 px-2 py-1 rounded">D</span> <span class="font-bold text-white bg-gray-800 px-2 py-1 rounded">F</span> <span class="font-bold text-white bg-gray-800 px-2 py-1 rounded">J</span> <span class="font-bold text-white bg-gray-800 px-2 py-1 rounded">K</span></p>
+        <button id="startBtn" class="px-8 py-4 bg-white text-black font-bold text-2xl rounded-full hover:bg-gray-200 transition transform hover:scale-105 active:scale-95 shadow-[0_0_20px_rgba(255,255,255,0.5)]">
+            GAME START
+        </button>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const scoreDisplay = document.getElementById('scoreDisplay');
+        const comboDisplay = document.getElementById('comboDisplay');
+        const judgeDisplay = document.getElementById('judgeDisplay');
+        const startScreen = document.getElementById('startScreen');
+        const startBtn = document.getElementById('startBtn');
+
+        // --- ゲーム設定 ---
+        const KEYS = ['d', 'f', 'j', 'k']; // 使うキー
+        const COLORS = ['#00ffff', '#ff00ff', '#ffff00', '#00ff00']; // レーンの色
+        const LANE_WIDTH = 80;
+        const NOTE_SPEED = 600; // ノーツの落下速度 (ピクセル/秒)
+        const HIT_Y_OFFSET = 100; // 下からの判定ラインの位置
+        const BPM = 120; // メトロノームのテンポ (1分間の拍数)
+        const TOTAL_BEATS = 40; // ゲーム全体の拍数 (この回数だけメトロノームが鳴ります)
+
+        // --- ゲームの状態 ---
+        let audioCtx;
+        let isPlaying = false;
+        let startTime = 0;
+        let notes = [];
+        let score = 0;
+        let combo = 0;
+        let maxCombo = 0; // 最大コンボ数を記録する変数を追加
+        let keyState = { 0: false, 1: false, 2: false, 3: false };
+        let hitEffects = [];
+        let metronomeOscillators = []; // メトロノームの音を管理
+
+        // 画面サイズのリサイズ処理
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // --- 音声生成 (Web Audio API) ---
+        function playHitSound(type) {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            
+            if (type === 'perfect') {
+                osc.frequency.setValueAtTime(880, audioCtx.currentTime); // 高い音
+            } else if (type === 'good') {
+                osc.frequency.setValueAtTime(440, audioCtx.currentTime); // 普通の音
+            } else {
+                osc.frequency.setValueAtTime(110, audioCtx.currentTime); // 低い音 (ミス)
+            }
+            
+            gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.1);
+        }
+
+        // --- メトロノームと譜面の生成 ---
+        function generateGameData() {
+            notes = [];
+            metronomeOscillators = [];
+            const beatInterval = 60 / BPM; // 1拍の秒数
+            let time = 2.0; // 開始から2秒後に最初の拍
+
+            // メトロノームの音をスケジュール設定＆ノーツを配置
+            for (let i = 0; i < TOTAL_BEATS; i++) {
+                // メトロノーム音の設定
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                
+                // 4拍ごとに高い音（チッ、カッ、カッ、カッ）
+                osc.frequency.value = (i % 4 === 0) ? 1000 : 600;
+                osc.type = 'triangle';
+                
+                // 音の鳴る時間は、startTimeからの相対時間ではなく、AudioContextの絶対時間を指定
+                const playTime = startTime + time;
+                gain.gain.setValueAtTime(0.1, playTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, playTime + 0.05);
+                
+                osc.start(playTime);
+                osc.stop(playTime + 0.05);
+                metronomeOscillators.push(osc);
+
+                // 最初の4拍（1小節）はカウントダウンとしてノーツを置かない
+                if (i >= 4) {
+                    // ノーツの配置 (4分音符、たまに8分音符を追加)
+                    notes.push({
+                        time: time,
+                        lane: Math.floor(Math.random() * 4),
+                        hit: false,
+                        missed: false
+                    });
+                    
+                    if (Math.random() > 0.7 && i < TOTAL_BEATS - 1) {
+                        // 8分音符の裏拍を追加
+                        notes.push({
+                            time: time + beatInterval / 2,
+                            lane: Math.floor(Math.random() * 4),
+                            hit: false,
+                            missed: false
+                        });
+                    }
+                }
+                
+                time += beatInterval;
+            }
+        }
+
+        // --- 判定処理 ---
+        function showJudge(text, color) {
+            judgeDisplay.textContent = text;
+            judgeDisplay.style.color = color;
+            judgeDisplay.classList.remove('animate-popup');
+            void judgeDisplay.offsetWidth; // アニメーションのリセット
+            judgeDisplay.classList.add('animate-popup');
+        }
+
+        // スコアとコンボの表示を更新する関数
+        function updateScoreAndCombo() {
+            scoreDisplay.textContent = score;
+            comboDisplay.textContent = combo;
+            
+            // 10コンボごとに色を変える配列
+            const COMBO_COLORS = [
+                '#ffffff', // 0-9: 白
+                '#00ffff', // 10-19: シアン
+                '#00ff00', // 20-29: 緑
+                '#ffff00', // 30-39: 黄
+                '#ffaa00', // 40-49: オレンジ
+                '#ff00ff', // 50-59: マゼンタ
+                '#ff0000', // 60以上: 赤
+            ];
+            
+            // コンボ数を10で割った数をインデックスにする（最大値は配列の最後）
+            const colorIndex = Math.min(Math.floor(combo / 10), COMBO_COLORS.length - 1);
+            comboDisplay.style.color = COMBO_COLORS[colorIndex];
+            
+            // コンボが繋がった時に少し大きくなるエフェクト
+            if (combo > 0) {
+                comboDisplay.style.transform = 'scale(1.3)';
+                setTimeout(() => {
+                    comboDisplay.style.transform = 'scale(1)';
+                }, 100);
+            }
+        }
+
+        function handleHit(laneIndex) {
+            keyState[laneIndex] = true;
+            hitEffects.push({ lane: laneIndex, time: performance.now(), alpha: 1 });
+
+            if (!isPlaying || !audioCtx) return;
+
+            const currentTime = audioCtx.currentTime - startTime;
+            
+            let targetNote = null;
+            for (let i = 0; i < notes.length; i++) {
+                let note = notes[i];
+                if (note.lane === laneIndex && !note.hit && !note.missed) {
+                    if (targetNote === null || note.time < targetNote.time) {
+                        targetNote = note;
+                    }
+                }
+            }
+
+            if (targetNote) {
+                const diff = Math.abs(targetNote.time - currentTime);
+
+                if (diff <= 0.08) { // Perfect
+                    targetNote.hit = true;
+                    score += 1000 + (combo * 10);
+                    combo++;
+                    maxCombo = Math.max(maxCombo, combo); // 最大コンボ数を更新
+                    showJudge('PERFECT', '#00ffff');
+                    playHitSound('perfect');
+                } else if (diff <= 0.15) { // Good
+                    targetNote.hit = true;
+                    score += 500;
+                    combo++;
+                    maxCombo = Math.max(maxCombo, combo); // 最大コンボ数を更新
+                    showJudge('GOOD', '#00ff00');
+                    playHitSound('good');
+                } else if (diff <= 0.25) { // Bad / Miss (早すぎた場合)
+                    targetNote.hit = true;
+                    combo = 0;
+                    showJudge('MISS', '#ff0000');
+                    playHitSound('miss');
+                }
+                
+                updateScoreAndCombo();
+            }
+        }
+
+        // --- 入力イベント ---
+        window.addEventListener('keydown', (e) => {
+            if(e.repeat) return; // 押しっぱなし防止
+            const key = e.key.toLowerCase();
+            const laneIndex = KEYS.indexOf(key);
+            if (laneIndex !== -1 && !keyState[laneIndex]) {
+                handleHit(laneIndex);
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            const key = e.key.toLowerCase();
+            const laneIndex = KEYS.indexOf(key);
+            if (laneIndex !== -1) {
+                keyState[laneIndex] = false;
+            }
+        });
+
+        // --- メインループ (描画と更新) ---
+        function gameLoop() {
+            if (!isPlaying) return;
+
+            const currentTime = audioCtx.currentTime - startTime;
+            const hitLineY = canvas.height - HIT_Y_OFFSET;
+            const startX = (canvas.width - (LANE_WIDTH * 4)) / 2;
+
+            // 背景クリア
+            ctx.fillStyle = '#111';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // レーンの描画
+            for (let i = 0; i < 4; i++) {
+                const x = startX + i * LANE_WIDTH;
+                
+                ctx.fillStyle = '#222';
+                ctx.fillRect(x, 0, LANE_WIDTH - 2, canvas.height);
+                
+                if (keyState[i]) {
+                    ctx.fillStyle = COLORS[i] + '40';
+                    ctx.fillRect(x, 0, LANE_WIDTH - 2, canvas.height);
+                }
+
+                ctx.fillStyle = '#666';
+                ctx.font = '20px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText(KEYS[i].toUpperCase(), x + LANE_WIDTH/2, hitLineY + 40);
+            }
+
+            // 判定ラインの描画
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(startX, hitLineY - 2, LANE_WIDTH * 4, 4);
+
+            // キー押下エフェクトの描画
+            for (let i = hitEffects.length - 1; i >= 0; i--) {
+                let effect = hitEffects[i];
+                const x = startX + effect.lane * LANE_WIDTH;
+                
+                ctx.beginPath();
+                ctx.arc(x + LANE_WIDTH/2, hitLineY, 40 * (1 - effect.alpha) + 20, 0, Math.PI * 2);
+                ctx.strokeStyle = COLORS[effect.lane] + Math.floor(effect.alpha * 255).toString(16).padStart(2, '0');
+                ctx.lineWidth = 4;
+                ctx.stroke();
+
+                effect.alpha -= 0.05;
+                if (effect.alpha <= 0) {
+                    hitEffects.splice(i, 1);
+                }
+            }
+
+            // ノーツの更新と描画
+            let allFinished = true;
+            for (let note of notes) {
+                if (note.hit) continue;
+
+                const y = hitLineY - (note.time - currentTime) * NOTE_SPEED;
+
+                if (y > canvas.height + 50) {
+                    if (!note.missed) {
+                        note.missed = true;
+                        combo = 0;
+                        updateScoreAndCombo();
+                        showJudge('MISS', '#ff0000');
+                    }
+                    continue;
+                }
+
+                allFinished = false;
+
+                if (y > -50) {
+                    const x = startX + note.lane * LANE_WIDTH;
+                    
+                    ctx.fillStyle = COLORS[note.lane];
+                    ctx.shadowBlur = 10;
+                    ctx.shadowColor = COLORS[note.lane];
+                    ctx.fillRect(x + 5, y - 10, LANE_WIDTH - 12, 20);
+                    
+                    ctx.shadowBlur = 0;
+                    ctx.fillStyle = '#fff';
+                    ctx.fillRect(x + 10, y - 5, LANE_WIDTH - 22, 10);
+                }
+            }
+
+            // 全部終わったら終了
+            if (allFinished && currentTime > notes[notes.length-1].time + 2) {
+                endGame();
+            } else {
+                requestAnimationFrame(gameLoop);
+            }
+        }
+
+        // --- ゲーム開始・終了 ---
+        function startGame() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+
+            score = 0;
+            combo = 0;
+            maxCombo = 0; // スタート時に最大コンボ数をリセット
+            updateScoreAndCombo();
+            judgeDisplay.textContent = '';
+            
+            startTime = audioCtx.currentTime;
+            generateGameData();
+            
+            isPlaying = true;
+            startScreen.classList.add('opacity-0', 'pointer-events-none');
+
+            requestAnimationFrame(gameLoop);
+        }
+
+        function endGame() {
+            isPlaying = false;
+            
+            // 残っているメトロノーム音を停止
+            for (let osc of metronomeOscillators) {
+                try { osc.stop(); } catch (e) {}
+            }
+            metronomeOscillators = [];
+
+            startScreen.classList.remove('opacity-0', 'pointer-events-none');
+            startScreen.querySelector('h1').textContent = 'FINISH!';
+            // スコアの下にMAX COMBOも表示するように変更
+            startScreen.querySelector('p').innerHTML = `SCORE: <span class="font-bold text-white">${score}</span><br>MAX COMBO: <span class="font-bold text-white">${maxCombo}</span>`;
+            
+            startBtn.textContent = 'RETRY';
+            startBtn.classList.remove('bg-gray-500', 'text-white');
+            startBtn.classList.add('bg-white', 'text-black');
+        }
+
+        startBtn.addEventListener('click', startGame);
+
+    </script>
+</body>
+</html>
